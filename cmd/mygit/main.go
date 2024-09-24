@@ -8,17 +8,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
 var ObjectsDir = ".git/objects"
-
-type ObjectKind int
-
-var (
-	ObjectKindBlob ObjectKind = 1
-	ObjectKindTree ObjectKind = 2
-)
 
 type ObjectMode string
 
@@ -26,7 +20,7 @@ var (
 	ObjectModeFile    ObjectMode = "100644"
 	ObjectModeExe                = "100755"
 	ObjectModeSymlink            = "120000"
-	ObjectModeDir                = "040000"
+	ObjectModeDir     ObjectMode = "40000"
 )
 
 type TreeObjectEntry struct {
@@ -48,7 +42,11 @@ func stringifyEntry(objectEntry *TreeObjectEntry, nameOnly bool) string {
 	)
 }
 
-type TreeObject = []*TreeObjectEntry
+type TreeObject struct {
+	ShaHash string
+	DirName string
+	Entries []*TreeObjectEntry
+}
 
 func SplitOn(b []byte, sep byte) ([]byte, []byte) {
 	i := bytes.IndexByte(b, sep)
@@ -81,8 +79,8 @@ func parseNextEntry(treeBody []byte) (*TreeObjectEntry, []byte) {
 	return object, nextBytes
 }
 
-func parseTreeObject(content []byte) (TreeObject, error) {
-	var entries TreeObject
+func parseTreeObject(content []byte) ([]*TreeObjectEntry, error) {
+	var entries []*TreeObjectEntry
 
 	header, body := SplitOn(content, 0)
 	if len(header) == 0 || len(body) == 0 {
@@ -125,6 +123,129 @@ func decompress(r io.Reader) []byte {
 	return out
 }
 
+func serializeTreeObject(entries []*TreeObjectEntry) []byte {
+	var buf bytes.Buffer
+	for _, entry := range entries {
+		buf.WriteString(string(entry.Mode))
+		buf.WriteByte(' ')
+		buf.WriteString(entry.FileName)
+		buf.WriteByte(0)
+		buf.Write(entry.shaHash)
+	}
+
+	bytes := buf.Bytes()
+
+	// prepend header
+
+	header := fmt.Sprintf("tree %d\x00", len(bytes))
+	return append([]byte(header), bytes...)
+}
+
+func treeFromDir(dir string) (*TreeObjectEntry, error) {
+	var entries []*TreeObjectEntry
+	dir = filepath.Clean(dir)
+
+	processFile := func(path string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if path == dir {
+			return nil
+		}
+
+		fileOrDirName := filepath.Base(path)
+		if fileOrDirName == ".git" {
+			return filepath.SkipDir
+		}
+
+		path, err = filepath.Rel(".", path)
+		if err != nil {
+			return err
+		}
+
+		if f.IsDir() {
+			entry, err := treeFromDir(path)
+			if err != nil {
+				return err
+			}
+
+			if entry != nil {
+				entries = append(entries, entry)
+			}
+
+			return filepath.SkipDir 
+		}
+
+		object, err := objectFromFile(path)
+		if err != nil {
+			return err
+		}
+
+		entries = append(entries, object)
+		return nil
+	}
+
+	err := filepath.Walk(dir, processFile)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	slices.SortFunc(entries, func(o1, o2 *TreeObjectEntry) int {
+		return strings.Compare(o1.FileName, o2.FileName)
+	})
+
+	contents := serializeTreeObject(entries)
+	hash := sha1.Sum(contents)
+
+	tree := &TreeObjectEntry{
+		shaHash:  hash[:],
+		FileName: dir,
+		Mode:     ObjectModeDir,
+	}
+
+	// write to disk
+	treeFilePath := filePathFromObjectHash(fmt.Sprintf("%x", hash))
+	dirName := filepath.Dir(treeFilePath)
+	if err := os.MkdirAll(dirName, os.ModePerm); err != nil {
+		return nil, err
+	}
+
+	treeFile, err := os.Create(treeFilePath)
+	if err != nil {
+		return nil, err
+	}
+
+	defer treeFile.Close()
+
+	zw := zlib.NewWriter(treeFile)
+	defer zw.Close()
+
+	_, err = zw.Write(contents)
+	if err != nil {
+		return nil, err
+	}
+
+	return tree, nil
+}
+
+func writeTree(_ []string) error {
+	t, err := treeFromDir(".")
+	if err != nil {
+		return err
+	}
+
+	if t != nil {
+		fmt.Println(fmt.Sprintf("%x", t.shaHash))
+	}
+
+	return nil
+}
+
 func lsTree(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: mygit ls-tree [--name-only] <hash>")
@@ -156,11 +277,53 @@ func lsTree(args []string) error {
 		return err
 	}
 
+	cmpObjects := func(o1, o2 *TreeObjectEntry) int {
+		return strings.Compare(o1.FileName, o2.FileName)
+	}
+
+	slices.SortFunc(tree, cmpObjects)
 	for _, entry := range tree {
 		fmt.Println(stringifyEntry(entry, nameOnly))
 	}
 
 	return nil
+}
+
+func objectFromFile(filePath string) (*TreeObjectEntry, error) {
+	contents, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	blobSize := fmt.Sprintf("blob %d", len(contents))
+	objectBytes := bytes.Join([][]byte{[]byte(blobSize), contents}, []byte{0})
+	hash := sha1.Sum(objectBytes)
+
+	shaSumStr := fmt.Sprintf("%x", hash[:])
+	dstPath := filePathFromObjectHash(shaSumStr)
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return nil, err
+	}
+
+	dstF, err := os.Create(dstPath)
+	if err != nil {
+		return nil, err
+	}
+	defer dstF.Close()
+
+	zwriter := zlib.NewWriter(dstF)
+	defer zwriter.Close()
+
+	_, err = zwriter.Write(objectBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &TreeObjectEntry{
+		shaHash:  hash[:],
+		Mode:     ObjectModeFile,
+		FileName: filepath.Base(filePath),
+	}, nil
 }
 
 func hashObject(args []string) error {
@@ -173,41 +336,17 @@ func hashObject(args []string) error {
 	}
 
 	filePath := args[1]
-
-	contents, err := os.ReadFile(filePath)
+	object, err := objectFromFile(filePath)
 	if err != nil {
 		return err
 	}
 
-	blobSize := fmt.Sprintf("blob %d", len(contents))
-	objectBytes := bytes.Join([][]byte{[]byte(blobSize), contents}, []byte{0})
-	hash := sha1.Sum(objectBytes)
-
-	shaSumStr := fmt.Sprintf("%x", hash[:])
-	dstPath := filePathFromObjectHash(shaSumStr)
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return err
-	}
-
-	dstF, err := os.Create(dstPath)
-	if err != nil {
-		return err
-	}
-	defer dstF.Close()
-
-	zwriter := zlib.NewWriter(dstF)
-	defer zwriter.Close()
-
-	_, err = zwriter.Write(objectBytes)
-	if err != nil {
-		return err
-	}
-
+	shaSumStr := fmt.Sprintf("%x", object.shaHash)
 	fmt.Print(shaSumStr)
 	return nil
 }
 
-// TODO: use a parser here instead.
+// TODO: use a parse helper function here instead.
 func catFile(args []string) error {
 	if len(args) != 2 {
 		return fmt.Errorf("usage: mygit cat-file -p <hash>")
@@ -291,6 +430,9 @@ func main() {
 
 	case "ls-tree":
 		err := lsTree(args)
+		must(err)
+	case "write-tree":
+		err := writeTree(args)
 		must(err)
 
 	default:

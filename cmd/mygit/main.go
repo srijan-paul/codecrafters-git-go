@@ -3,11 +3,58 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
+
+func hashObject(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("Expected 2 arguments")
+	}
+
+	if args[0] != "-w" {
+		return fmt.Errorf("Expected -w flag")
+	}
+
+	filePath := args[1]
+
+
+	contents, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	blobSize := fmt.Sprintf("blob %d", len(contents))
+	objectBytes:= bytes.Join([][]byte { []byte(blobSize), contents}, []byte{0})
+	hash := sha1.Sum(objectBytes)
+
+	shaSumStr := fmt.Sprintf("%x", hash[:])
+	dstPath := filepath.Join(".git/objects", shaSumStr[:2], shaSumStr[2:])
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return err	
+	}
+	
+	dstF, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dstF.Close()
+	
+	zwriter := zlib.NewWriter(dstF)
+	defer zwriter.Close()
+
+	_, err = zwriter.Write(objectBytes)
+	if err != nil {
+		return err
+	}
+
+	fmt.Print(shaSumStr)
+	return nil
+}
+
 
 func catFile(args []string) error {
 	if len(args) != 2 {
@@ -44,10 +91,13 @@ func catFile(args []string) error {
 		return err
 	}
 
-	pieces := bytes.Split(decompressedBytes, []byte{0})
-	// _ := string(pieces[0])
-	payload := string(pieces[1])
-	// header = strings.TrimPrefix(header, "blob ")
+	delimIndex := bytes.Index(decompressedBytes, []byte{0})
+	if delimIndex == -1 {
+		return fmt.Errorf("Invalid object")
+	}
+
+	payloadBytes := decompressedBytes[delimIndex+1:] 
+	payload := string(payloadBytes)
 
 	fmt.Print(payload)
 	return nil
@@ -91,6 +141,10 @@ func main() {
 
 	case "cat-file":
 		err := catFile(args)
+		must(err)
+
+	case "hash-object":
+		err := hashObject(args)
 		must(err)
 
 	default:

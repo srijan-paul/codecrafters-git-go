@@ -49,7 +49,7 @@ func catFile(args []string) error {
 	payload := string(pieces[1])
 	// header = strings.TrimPrefix(header, "blob ")
 
-	fmt.Println(payload)
+	fmt.Print(payload)
 	return nil
 }
 

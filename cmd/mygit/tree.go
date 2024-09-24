@@ -33,7 +33,8 @@ type Object struct {
 	// when including commits,
 	// this will be a "tagged union":
 	// with fields `.Commit`, `.Tree`, and `.Blob` fields.
-	// the `.Tree` can have `.Entries`, and `.Commit` can have `.Message` and `.Author`.
+	// the `.Tree` can have `.Entries`,
+	// and `.Commit` can have `.Message` and `.Author`, etc.
 	ShaHash  []byte
 	FileName string
 	Mode     ObjectMode
